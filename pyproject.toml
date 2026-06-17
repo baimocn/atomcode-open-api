@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atomcode-open-api"
+version = "1.0.0"
+description = "将 AtomCode CodingPlan 免费模型额度转为标准 OpenAI API 的反向代理"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "baimo"},
+]
+keywords = ["atomcode", "openai", "api", "proxy", "deepseek", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dependencies = [
+    "cryptography>=41.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+atomcode-open-api = "atomcode_open_api.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-username/atomcode-open-api"
+Repository = "https://github.com/your-username/atomcode-open-api"
+Issues = "https://github.com/your-username/atomcode-open-api/issues"
+
+[tool.setuptools.packages.find]
+include = ["atomcode_open_api*"]
