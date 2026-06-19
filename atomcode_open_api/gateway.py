@@ -45,6 +45,8 @@ class Gateway:
         self._model_cache: Optional[Dict] = None
         self._model_cache_time: float = 0
         self._model_cache_ttl: float = 300  # 5 分钟缓存
+        # 最近一次请求的耗时（毫秒）；-1 表示请求异常
+        self.latency_ms: int = 0
 
     def _build_headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构建请求头"""
@@ -69,12 +71,17 @@ class Gateway:
         headers = self._build_headers(extra_headers)
 
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        start = time.monotonic()
         try:
             with urllib.request.urlopen(req, context=_SSL_CTX, timeout=120) as resp:
-                return resp.status, resp.read()
+                status, data = resp.status, resp.read()
+                self.latency_ms = int((time.monotonic() - start) * 1000)
+                return status, data
         except urllib.error.HTTPError as e:
+            self.latency_ms = int((time.monotonic() - start) * 1000)
             return e.code, e.read()
         except Exception as e:
+            self.latency_ms = -1
             raise GatewayError(0, "NETWORK_ERROR", str(e))
 
     def fetch_models(self) -> Dict:
@@ -108,7 +115,11 @@ class Gateway:
         Returns:
             (status_code, response_body)
         """
-        return self._request("POST", "/v1/chat/completions", body)
+        try:
+            return self._request("POST", "/v1/chat/completions", body)
+        except GatewayError:
+            self.latency_ms = -1
+            raise
 
     def chat_completions_stream(self, body: bytes) -> Generator[bytes, None, None]:
         """
@@ -121,6 +132,7 @@ class Gateway:
         headers = self._build_headers()
 
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        start = time.monotonic()
         try:
             with urllib.request.urlopen(req, context=_SSL_CTX, timeout=300) as resp:
                 buffer = b""
@@ -136,10 +148,13 @@ class Gateway:
                             yield line
                 if buffer.strip():
                     yield buffer.strip()
+            self.latency_ms = int((time.monotonic() - start) * 1000)
         except urllib.error.HTTPError as e:
+            self.latency_ms = -1
             error_body = e.read()
             yield f'data: {json.dumps({"error": {"message": error_body.decode("utf-8", errors="replace"), "code": e.code}})}'.encode()
             yield b"data: [DONE]"
         except Exception as e:
+            self.latency_ms = -1
             yield f'data: {json.dumps({"error": {"message": str(e)}})}'.encode()
             yield b"data: [DONE]"

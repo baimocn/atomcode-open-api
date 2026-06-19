@@ -11,12 +11,15 @@ import socketserver
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 from . import __version__
 from .auth import AuthInfo
 from .gateway import Gateway, GatewayError
+from .health_checker import GatewayPool
+from .logger_db import AsyncLogWriter, LogEntry, default_db_path, query_stats
 from .models import ModelMapper
+from .rate_limiter import RateLimiter
 
 
 class RequestStats:
@@ -55,6 +58,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     model_mapper: ModelMapper = None  # type: ignore
     stats: RequestStats = None  # type: ignore
     auth: AuthInfo = None  # type: ignore
+    log_writer: Optional[AsyncLogWriter] = None
+    log_db_path: str = ""
+    rate_limiter: Optional[RateLimiter] = None
+    gateway_pool: Optional[GatewayPool] = None
     verbose: bool = False
 
     def do_GET(self):
@@ -64,6 +71,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._handle_health()
         elif self.path == "/":
             self._handle_index()
+        elif self.path == "/stats" or self.path.startswith("/stats?"):
+            self._handle_stats()
         else:
             self._respond_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
 
@@ -86,10 +95,56 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_chat_completions(self, body: bytes):
         """处理 /v1/chat/completions 请求"""
+        start_ts = time.time()
+
+        # 速率限制（可选）
+        if self.rate_limiter is not None:
+            decision = self.rate_limiter.try_acquire()
+            if not decision["allowed"]:
+                if decision["queued"]:
+                    self._respond_json(202, {
+                        "status": "queued",
+                        "queue_position": decision["queue_position"],
+                        "request_id": decision.get("request_id"),
+                        "message": decision["message"],
+                    })
+                    self._log_request(
+                        start_ts=start_ts,
+                        status_code=202,
+                        model_requested="",
+                        model_mapped="",
+                        is_stream=False,
+                        error_message="queued: rate limited",
+                    )
+                else:
+                    self._respond_json(429, {
+                        "error": {
+                            "message": decision["message"],
+                            "type": "rate_limit_error",
+                        }
+                    })
+                    self._log_request(
+                        start_ts=start_ts,
+                        status_code=429,
+                        model_requested="",
+                        model_mapped="",
+                        is_stream=False,
+                        error_message=decision["message"],
+                    )
+                return
+
         try:
             req = json.loads(body)
         except json.JSONDecodeError:
             self._respond_json(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
+            self._log_request(
+                start_ts=start_ts,
+                status_code=400,
+                model_requested="",
+                model_mapped="",
+                is_stream=False,
+                error_message="Invalid JSON body",
+            )
             return
 
         # 映射模型名称
@@ -104,35 +159,89 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(req).encode()
 
         if is_stream:
-            self._handle_stream(body)
+            self._handle_stream(body, start_ts, original_model, mapped_model)
         else:
-            self._handle_non_stream(body)
+            self._handle_non_stream(body, start_ts, original_model, mapped_model)
 
-    def _handle_non_stream(self, body: bytes):
+    def _select_gateway(self) -> Tuple[Gateway, str]:
+        """根据是否启用 gateway_pool，选择本次请求使用的 Gateway 与 URL。"""
+        if self.gateway_pool is not None:
+            url = self.gateway_pool.select()
+            return self.gateway_pool.get_gateway(url), url
+        return self.gateway, getattr(self.gateway, "gateway_url", "")
+
+    def _handle_non_stream(self, body: bytes, start_ts: float,
+                            original_model: str, mapped_model: str):
         """处理非流式请求"""
+        prompt_tokens: Optional[int] = None
+        completion_tokens: Optional[int] = None
+        error_message: Optional[str] = None
+        gateway, gw_url = self._select_gateway()
+        req_start = time.monotonic()
         try:
-            status, resp_body = self.gateway.chat_completions(body)
+            status, resp_body = gateway.chat_completions(body)
             if status == 200:
                 try:
                     data = json.loads(resp_body)
-                    usage = data.get("usage", {})
+                    usage = data.get("usage", {}) or {}
                     tokens = usage.get("total_tokens", 0)
+                    prompt_tokens = usage.get("prompt_tokens")
+                    completion_tokens = usage.get("completion_tokens")
                     self.stats.record(tokens=tokens)
-                except:
+                except Exception:
                     self.stats.record()
             else:
                 self.stats.record(error=True)
+                try:
+                    error_message = resp_body.decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    error_message = None
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self._send_cors_headers()
             self.end_headers()
             self.wfile.write(resp_body)
+
+            self._log_request(
+                start_ts=start_ts,
+                status_code=status,
+                model_requested=original_model,
+                model_mapped=mapped_model,
+                is_stream=False,
+                token_count_prompt=prompt_tokens,
+                token_count_completion=completion_tokens,
+                error_message=error_message,
+            )
+            # 上报到 GatewayPool（如启用）
+            if self.gateway_pool is not None and gw_url:
+                lat = int((time.monotonic() - req_start) * 1000)
+                success = 200 <= status < 500
+                self.gateway_pool.report_result(gw_url, lat, success)
+                if status >= 500:
+                    self.gateway_pool.mark_down(gw_url)
         except GatewayError as e:
             self.stats.record(error=True)
-            self._respond_json(e.status or 502, {"error": {"message": e.message, "type": "server_error"}})
+            status = e.status or 502
+            self._respond_json(status, {"error": {"message": e.message, "type": "server_error"}})
+            self._log_request(
+                start_ts=start_ts,
+                status_code=status,
+                model_requested=original_model,
+                model_mapped=mapped_model,
+                is_stream=False,
+                error_message=str(e.message)[:500],
+            )
+            if self.gateway_pool is not None and gw_url:
+                self.gateway_pool.report_result(gw_url, -1, False)
+                self.gateway_pool.mark_down(gw_url)
 
-    def _handle_stream(self, body: bytes):
+    def _handle_stream(self, body: bytes, start_ts: float,
+                       original_model: str, mapped_model: str):
         """处理流式请求"""
+        status = 200
+        error_message: Optional[str] = None
+        gateway, gw_url = self._select_gateway()
+        req_start = time.monotonic()
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -141,17 +250,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.end_headers()
 
-            for line in self.gateway.chat_completions_stream(body):
+            for line in gateway.chat_completions_stream(body):
                 self.wfile.write(line + b"\n")
                 self.wfile.flush()
 
             self.stats.record()
         except Exception as e:
             self.stats.record(error=True)
+            status = 500
+            error_message = str(e)[:500]
             error_data = json.dumps({"error": {"message": str(e)}})
-            self.wfile.write(f"data: {error_data}\n".encode())
-            self.wfile.write(b"data: [DONE]\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(f"data: {error_data}\n".encode())
+                self.wfile.write(b"data: [DONE]\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+        finally:
+            if self.gateway_pool is not None and gw_url:
+                lat = int((time.monotonic() - req_start) * 1000) if status == 200 else -1
+                self.gateway_pool.report_result(gw_url, lat, status == 200)
+                if status >= 500:
+                    self.gateway_pool.mark_down(gw_url)
+            self._log_request(
+                start_ts=start_ts,
+                status_code=status,
+                model_requested=original_model,
+                model_mapped=mapped_model,
+                is_stream=True,
+                # 流式响应无法从 SSE 中可靠汇总 token 用量
+                token_count_prompt=-1,
+                token_count_completion=-1,
+                error_message=error_message,
+            )
 
     def _handle_models(self):
         """处理 /v1/models 请求"""
@@ -162,9 +293,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except GatewayError as e:
             self._respond_json(e.status or 502, {"error": {"message": e.message}})
 
+    def _handle_stats(self):
+        """处理 /stats 请求：返回最近 N 小时的统计摘要"""
+        from urllib.parse import urlparse, parse_qs
+
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query or "")
+        try:
+            hours = int(qs.get("hours", ["24"])[0])
+        except (TypeError, ValueError):
+            hours = 24
+        if hours <= 0:
+            hours = 24
+
+        if not self.log_db_path:
+            self._respond_json(503, {"error": {"message": "logging not enabled"}})
+            return
+
+        # 在查询前先把 writer 中的 pending 项写入，确保统计反映最新数据
+        if self.log_writer is not None:
+            try:
+                self.log_writer.flush_now()
+            except Exception:
+                pass
+
+        try:
+            data = query_stats(self.log_db_path, hours=hours)
+            self._respond_json(200, data)
+        except Exception as e:
+            self._respond_json(500, {"error": {"message": f"stats query failed: {e}"}})
+
     def _handle_health(self):
         """处理 /health 健康检查"""
-        self._respond_json(200, {
+        payload = {
             "status": "ok",
             "version": __version__,
             "gateway": self.gateway.gateway_url,
@@ -174,7 +335,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "errors": self.stats.errors,
             "uptime": self.stats.uptime_display,
             "token_expires_in": self.auth.remaining_display,
-        })
+            "rate_limit": (
+                self.rate_limiter.stats() if self.rate_limiter is not None
+                else {"enabled": False}
+            ),
+        }
+        if self.gateway_pool is not None:
+            payload["gateways"] = self.gateway_pool.status()
+        self._respond_json(200, payload)
 
     def _handle_index(self):
         """处理 / 根路径"""
@@ -189,6 +357,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 <li><code>GET  /v1/models</code> - List available models</li>
 <li><code>POST /v1/chat/completions</code> - Chat completions</li>
 <li><code>GET  /health</code> - Health check & stats</li>
+<li><code>GET  /stats</code> - Persistent request stats (?hours=N)</li>
 </ul>
 <h2>Usage</h2>
 <pre>
@@ -230,6 +399,37 @@ api_key:  any-string (ignored)
         sys.stderr.write(f"  {message}\n")
         sys.stderr.flush()
 
+    def _log_request(self, *, start_ts: float, status_code: int,
+                     model_requested: str, model_mapped: str,
+                     is_stream: bool,
+                     token_count_prompt: Optional[int] = None,
+                     token_count_completion: Optional[int] = None,
+                     error_message: Optional[str] = None) -> None:
+        """把当前请求记录写入异步日志队列（不阻塞）。"""
+        if self.log_writer is None:
+            return
+        try:
+            latency_ms = int((time.time() - start_ts) * 1000)
+            gateway_used = getattr(self.gateway, "gateway_url", "") if self.gateway else ""
+            entry = LogEntry(
+                timestamp=int(start_ts),
+                method=self.command or "POST",
+                path=self.path.split("?", 1)[0],
+                model_requested=model_requested or None,
+                model_mapped=model_mapped or None,
+                status_code=status_code,
+                latency_ms=latency_ms,
+                is_stream=is_stream,
+                token_count_prompt=token_count_prompt,
+                token_count_completion=token_count_completion,
+                error_message=error_message,
+                gateway_used=gateway_used,
+            )
+            self.log_writer.log(entry)
+        except Exception:
+            # 日志失败绝不影响业务响应
+            pass
+
     def log_message(self, format, *args):
         # 只记录非健康检查的请求
         msg = format % args
@@ -239,7 +439,11 @@ api_key:  any-string (ignored)
 
 
 def create_handler_class(gateway: Gateway, model_mapper: ModelMapper,
-                         auth: AuthInfo, verbose: bool = False):
+                         auth: AuthInfo, verbose: bool = False,
+                         log_db_path: Optional[str] = None,
+                         log_writer: Optional[AsyncLogWriter] = None,
+                         rate_limiter: Optional[RateLimiter] = None,
+                         gateway_pool: Optional[GatewayPool] = None):
     """
     创建绑定了依赖的请求处理器类
 
@@ -248,11 +452,20 @@ def create_handler_class(gateway: Gateway, model_mapper: ModelMapper,
         model_mapper: 模型名称映射器
         auth: 认证信息
         verbose: 是否输出详细日志
+        log_db_path: 日志 SQLite 路径；为 None 时使用默认路径
+        log_writer: 可选的预构造 AsyncLogWriter（测试时方便注入）
+        rate_limiter: 可选的 RateLimiter；为 None 时不启用限流
 
     Returns:
-        可用于 HTTPServer 的处理器类
+        (BoundHandler, stats, log_writer)
     """
     stats = RequestStats()
+
+    if log_writer is None:
+        db_path = log_db_path or default_db_path()
+        log_writer = AsyncLogWriter(db_path)
+    else:
+        db_path = log_writer.db_path
 
     class BoundHandler(ProxyHandler):
         pass
@@ -261,6 +474,10 @@ def create_handler_class(gateway: Gateway, model_mapper: ModelMapper,
     BoundHandler.model_mapper = model_mapper
     BoundHandler.stats = stats
     BoundHandler.auth = auth
+    BoundHandler.log_writer = log_writer
+    BoundHandler.log_db_path = db_path
+    BoundHandler.rate_limiter = rate_limiter
+    BoundHandler.gateway_pool = gateway_pool
     BoundHandler.verbose = verbose
 
-    return BoundHandler, stats
+    return BoundHandler, stats, log_writer
