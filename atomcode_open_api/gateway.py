@@ -136,7 +136,8 @@ class Gateway:
         try:
             with urllib.request.urlopen(req, context=_SSL_CTX, timeout=300) as resp:
                 buffer = b""
-                while True:
+                done = False
+                while not done:
                     chunk = resp.read(4096)
                     if not chunk:
                         break
@@ -146,7 +147,13 @@ class Gateway:
                         line = line.strip()
                         if line:
                             yield line
-                if buffer.strip():
+                            # 上游发完 [DONE] 后往往不关闭连接，必须立刻结束转发，
+                            # 否则 read() 会一直阻塞、客户端拿不到流结束信号
+                            # （表现为 Cline 一直显示 thinking）
+                            if b"[DONE]" in line:
+                                done = True
+                                break
+                if not done and buffer.strip():
                     yield buffer.strip()
             self.latency_ms = int((time.monotonic() - start) * 1000)
         except urllib.error.HTTPError as e:

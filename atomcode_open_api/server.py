@@ -246,12 +246,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+            # 流式响应没有 Content-Length / chunked 分帧，客户端只能靠连接关闭
+            # 判断响应体结束；若声明 keep-alive，客户端（Cline 等）会一直等待、
+            # 表现为永远停在 thinking。这里必须声明 close 并主动关闭连接。
+            self.send_header("Connection", "close")
+            self.close_connection = True
             self._send_cors_headers()
             self.end_headers()
 
             for line in gateway.chat_completions_stream(body):
-                self.wfile.write(line + b"\n")
+                # SSE 以空行分隔事件：每条 data 行后必须补一个空行，
+                # 否则客户端（openai SDK / Cline）不会分发任何事件，
+                # 表现为一直停在 thinking。
+                self.wfile.write(line + b"\n\n")
                 self.wfile.flush()
 
             self.stats.record()
